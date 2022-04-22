@@ -46,6 +46,7 @@ class Watcher(object):
         self._callback_thread = None
         self._new_watch_cond = threading.Condition(lock=self._lock)
         self._new_watch = None
+        self._stopping = False
 
     def _create_watch_request(self, key, range_end=None, start_revision=None,
                               progress_notify=False, filters=None,
@@ -59,7 +60,7 @@ class Watcher(object):
         if progress_notify:
             create_watch.progress_notify = progress_notify
         if filters is not None:
-            create_watch.filters = filters
+            create_watch.filters.extend(filters)
         if prev_kv:
             create_watch.prev_kv = prev_kv
         return etcdrpc.WatchRequest(create_request=create_watch)
@@ -72,6 +73,12 @@ class Watcher(object):
                                         filters=filters, prev_kv=prev_kv)
         
         with self._lock:
+            # Wait for exiting thread to close
+            if self._stopping:
+                self._callback_thread.join()
+                self._callback_thread = None
+                self._stopping = False
+
             # Start the callback thread if it is not yet running.
             if not self._callback_thread:
                 thread_name = 'etcd3_watch_%x' % (id(self),)
@@ -118,32 +125,35 @@ class Watcher(object):
             self._cancel_no_lock(watch_id)
 
     def _run(self):
-        while True:
+        callback_err = None
+        try:
             response_iter = self._watch_stub.Watch(
                 _new_request_iter(self._request_queue),
                 credentials=self._credentials,
                 metadata=self._metadata)
-            try:
-                for rs in response_iter:
-                    self._handle_response(rs)
+            for rs in response_iter:
+                self._handle_response(rs)
 
-            except grpc.RpcError as err:
-                with self._lock:
-                    if self._new_watch:
-                        self._new_watch.err = err
-                        self._new_watch_cond.notify_all()
+        except grpc.RpcError as err:
+            callback_err = err
 
-                    callbacks = self._callbacks
-                    
-                    # Rotate request queue. This way we can terminate one gRPC
-                    # stream and initiate another one whilst avoiding a race
-                    # between them over requests in the queue.
-                    self._request_queue.put(None)
-                    self._request_queue = queue.Queue(maxsize=10)
+        finally:
+            with self._lock:
+                self._stopping = True
+                if self._new_watch:
+                    self._new_watch.err = callback_err
+                    self._new_watch_cond.notify_all()
+                callbacks = self._callbacks
+                self._callbacks = {}
 
-                    for callback in six.itervalues(self._callbacks):
-                        _safe_callback(callback, err)
-                    self._callbacks = {}
+                # Rotate request queue. This way we can terminate one gRPC
+                # stream and initiate another one whilst avoiding a race
+                # between them over requests in the queue.
+                self._request_queue.put(None)
+                self._request_queue = queue.Queue(maxsize=10)
+
+            for callback in six.itervalues(callbacks):
+                _safe_callback(callback, callback_err)
 
     def _handle_response(self, rs):
         with self._lock:
@@ -197,6 +207,12 @@ class Watcher(object):
         cancel_watch.watch_id = watch_id
         rq = etcdrpc.WatchRequest(cancel_request=cancel_watch)
         self._request_queue.put(rq)
+
+    def close(self):
+        """close queue"""
+        with self._lock:
+            if self._callback_thread and not self._stopping:
+                self._request_queue.put(None)
 
 
 class WatchResponse(object):
